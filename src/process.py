@@ -4,32 +4,34 @@ import json
 import time
 
 # =========================
-# FORCE PYTHON (for pyspark stability)
+# FORCE PYTHON
 # =========================
 os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
 from pyspark.sql import SparkSession
 from pyspark.sql.types import *
-from pyspark.sql.functions import (
-    avg, max as spark_max, min as spark_min,
-    to_timestamp, col, window
-)
+from pyspark.sql.functions import *
+from delta.tables import DeltaTable
 
 # =========================
 # PATHS
 # =========================
 RAW_PATH = "file:///E:/Projects/crypto-data-pipeline/data/raw_prices.json"
-DELTA_PATH = "file:///E:/Projects/crypto-data-pipeline/data/processed/crypto_delta"
-TIME_SERIES_PATH = "file:///E:/Projects/crypto-data-pipeline/data/processed/time_series_delta"
-STATE_PATH = r"E:\Projects\crypto-data-pipeline\metadata\state.json"
+
+BRONZE_PATH = "E:/Projects/crypto-data-pipeline/data/processed/crypto_bronze"
+SILVER_PATH = "E:/Projects/crypto-data-pipeline/data/processed/crypto_silver"
+GOLD_PATH   = "E:/Projects/crypto-data-pipeline/data/processed/crypto_gold"
+
+STATE_PATH = "E:/Projects/crypto-data-pipeline/metadata/state.json"
 
 # =========================
 # SPARK SESSION
 # =========================
 spark = SparkSession.builder \
-    .appName("crypto-delta-incremental") \
-    .master("local[*]") \
+    .appName("crypto-medallion-pipeline") \
+    .master("local[1]") \
+    .config("spark.driver.host", "127.0.0.1") \
     .config("spark.local.dir", "E:/Projects/crypto-data-pipeline/spark-temp") \
     .config("spark.jars.packages", "io.delta:delta-spark_2.12:3.1.0") \
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
@@ -76,76 +78,106 @@ print("Last processed timestamp:", last_processed_timestamp)
 # =========================
 df = spark.read.schema(schema).json(RAW_PATH)
 
-# =========================
-# FIX TIMESTAMP
-# =========================
 df = df.withColumn("timestamp", to_timestamp("timestamp"))
+df = df.withColumn("date", to_date("timestamp"))
 
 # =========================
-# FILTER NEW DATA (INCREMENTAL)
+# INCREMENTAL FILTER
 # =========================
 df_new = df.filter(col("timestamp") > last_processed_timestamp)
+new_count = df_new.count()
 
-count_new = df_new.count()
-print("New records count:", count_new)
+print("New records:", new_count)
 
-if count_new == 0:
-    print("No new data. Exiting.")
-    spark.stop()
-    exit()
+# ==========================================================
+# 🥇 BRONZE (RAW + MERGE)
+# ==========================================================
+if new_count > 0:
+    if not DeltaTable.isDeltaTable(spark, BRONZE_PATH):
+        print("Creating Bronze...")
+        df_new.write.format("delta").mode("overwrite").partitionBy("date").save(BRONZE_PATH)
+    else:
+        print("Merging into Bronze...")
+        bronze = DeltaTable.forPath(spark, BRONZE_PATH)
 
-# =========================
-# CLEAN DATA
-# =========================
-df_clean = df_new.dropna(subset=["price_usd", "asset_id"])
+        bronze.alias("t").merge(
+            df_new.alias("s"),
+            "t.asset_id = s.asset_id AND t.timestamp = s.timestamp"
+        ).whenMatchedUpdateAll() \
+         .whenNotMatchedInsertAll() \
+         .execute()
 
-# =========================
-# AGGREGATION
-# =========================
-df_agg = df_clean.groupBy("asset_id").agg(
-    avg("price_usd").alias("avg_price"),
-    spark_max("price_usd").alias("max_price"),
-    spark_min("price_usd").alias("min_price"),
-    avg("volume_24h_usd").alias("avg_volume")
-)
+# ==========================================================
+# 🥈 SILVER (REAL CLEANING)
+# ==========================================================
+if new_count > 0:
 
-# =========================
-# TIME-BASED AGGREGATION
-# =========================
-df_time = df_clean.groupBy(
-    window("timestamp", "1 minute"),
-    "asset_id"
-).agg(
-    avg("price_usd").alias("avg_price")
-)
+    df_silver = df_new \
+        .dropna(subset=["price_usd", "asset_id"]) \
+        .filter(col("price_usd") > 0) \
+        .filter(col("volume_24h_usd") > 0) \
+        .filter(col("market_cap_usd") > 0) \
+        .dropDuplicates(["asset_id", "timestamp"])
 
-# =========================
-# WRITE DELTA (APPEND MODE NOW)
-# =========================
-df_agg.write \
-    .format("delta") \
-    .mode("append") \
-    .save(DELTA_PATH)
+    df_silver.write \
+        .format("delta") \
+        .mode("append") \
+        .partitionBy("date") \
+        .save(SILVER_PATH)
 
-df_time.write \
-    .format("delta") \
-    .mode("append") \
-    .partitionBy("asset_id") \
-    .save(TIME_SERIES_PATH)
+    print("Silver updated")
 
-print("Data written successfully")
+# ==========================================================
+# 🥇 GOLD (AGGREGATION)
+# ==========================================================
+if DeltaTable.isDeltaTable(spark, SILVER_PATH):
 
-# =========================
+    df_full = spark.read.format("delta").load(SILVER_PATH)
+
+    df_gold = df_full.groupBy("asset_id").agg(
+        avg("price_usd").alias("avg_price"),
+        max("price_usd").alias("max_price"),
+        min("price_usd").alias("min_price"),
+        avg("volume_24h_usd").alias("avg_volume")
+    )
+
+    df_gold.write \
+        .format("delta") \
+        .mode("overwrite") \
+        .save(GOLD_PATH)
+
+    print("Gold updated")
+
+# ==========================================================
 # UPDATE STATE
-# =========================
-max_ts = df_new.select(spark_max("timestamp")).collect()[0][0]
+# ==========================================================
+if new_count > 0:
+    max_ts = df_new.select(max("timestamp")).collect()[0][0]
+    if max_ts:
+        with open(STATE_PATH, "w") as f:
+            json.dump({"last_processed_timestamp": max_ts.isoformat()}, f)
 
-if max_ts:
-    new_ts = max_ts.isoformat()
-    with open(STATE_PATH, "w") as f:
-        json.dump({"last_processed_timestamp": new_ts}, f)
+# ==========================================================
+# 📊 VALIDATION + COUNTS
+# ==========================================================
+print("\n=== DATA VALIDATION ===")
 
-    print("Updated last_processed_timestamp:", new_ts)
+if DeltaTable.isDeltaTable(spark, BRONZE_PATH):
+    df_b = spark.read.format("delta").load(BRONZE_PATH)
+
+    print("Bronze count:", df_b.count())
+
+    null_price = df_b.filter(col("price_usd").isNull()).count()
+    print("Null price rows:", null_price)
+
+    dup = df_b.groupBy("asset_id", "timestamp").count().filter("count > 1").count()
+    print("Duplicate rows:", dup)
+
+if DeltaTable.isDeltaTable(spark, SILVER_PATH):
+    print("Silver count:", spark.read.format("delta").load(SILVER_PATH).count())
+
+if DeltaTable.isDeltaTable(spark, GOLD_PATH):
+    print("Gold count:", spark.read.format("delta").load(GOLD_PATH).count())
 
 # =========================
 # STOP
