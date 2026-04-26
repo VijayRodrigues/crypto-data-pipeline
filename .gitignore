@@ -1,1 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
 
+# Virtual env
+cdp-env/
+venv/
+
+# Data
+data/raw/
+data/processed/
+
+# Spark temp
+spark-temp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
