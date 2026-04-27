@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: prefect-postgres
+    environment:
+      POSTGRES_USER: prefect
+      POSTGRES_PASSWORD: prefect
+      POSTGRES_DB: prefect
+    ports:
+      - "5432:5432"
+    volumes:
+      - prefect-db:/var/lib/postgresql/data
+
+  prefect-server:
+    image: prefecthq/prefect:3-latest
+    container_name: prefect-server
+    command: prefect server start --host 0.0.0.0
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://prefect:prefect@postgres:5432/prefect
+    ports:
+      - "4200:4200"
+    depends_on:
+      - postgres
+
+  worker:
+    build: .
+    container_name: prefect-worker
+    command: >
+      sh -c "sleep 20 && prefect worker start --pool default-pool"
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+    volumes:
+      - ./:/app
+    working_dir: /app
+    depends_on:
+      - prefect-server
+
+volumes:
+  prefect-db:

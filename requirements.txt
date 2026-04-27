@@ -1,0 +1,12 @@
+prefect==3.6.28
+
+# API + data handling
+requests==2.33.1
+pandas==3.0.2
+
+# Spark + Delta
+pyspark==3.5.4
+delta-spark==3.1.0
+
+# Needed by Spark internally (don’t remove)
+py4j==0.10.9.7

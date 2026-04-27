@@ -12,7 +12,6 @@ API_URL = "https://api.coingecko.com/api/v3/coins/markets"
 COINS = "bitcoin,ethereum,binancecoin,solana,ripple"
 VS_CURRENCY = "usd"
 
-INTERVAL = 15          # final decision
 RATE_LIMIT_SLEEP = 60  # backoff for 429
 
 OUTPUT_PATH = os.path.join("data", "raw_prices.json")
@@ -95,30 +94,35 @@ def write_data(records):
 
 
 # =========================
-# MAIN LOOP
+# SINGLE RUN INGESTION
 # =========================
 def run():
-    print("Starting ingestion...")
+    print("Starting ingestion (single batch)...")
 
-    while True:
+    data = fetch_data()
+
+    # Retry once if API fails
+    if data is None:
+        print("Retrying after short delay...")
+        time.sleep(5)
         data = fetch_data()
 
         if data is None:
-            continue
+            print("Failed to fetch data. Exiting.")
+            return
 
-        try:
-            records = transform_data(data)
-            write_data(records)
+    try:
+        records = transform_data(data)
+        write_data(records)
 
-            print(f"[{datetime.utcnow()}] Ingested {len(records)} records")
+        print(f"[{datetime.utcnow()}] Ingested {len(records)} records")
 
-            # jitter to avoid exact pattern
-            time.sleep(INTERVAL + random.uniform(0, 2))
-
-        except Exception as e:
-            print(f"[{datetime.utcnow()}] Processing error: {e}")
-            time.sleep(5)
+    except Exception as e:
+        print(f"[{datetime.utcnow()}] Processing error: {e}")
 
 
+# =========================
+# ENTRY POINT
+# =========================
 if __name__ == "__main__":
     run()

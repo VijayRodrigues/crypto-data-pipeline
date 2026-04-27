@@ -4,7 +4,7 @@ import json
 import time
 
 # =========================
-# FORCE PYTHON
+# FORCE PYTHON (Spark)
 # =========================
 os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
@@ -15,24 +15,30 @@ from pyspark.sql.functions import *
 from delta.tables import DeltaTable
 
 # =========================
-# PATHS
+# BASE PATH (CRITICAL FIX)
 # =========================
-RAW_PATH = "file:///E:/Projects/crypto-data-pipeline/data/raw_prices.json"
+BASE_DIR = "/app"
 
-BRONZE_PATH = "E:/Projects/crypto-data-pipeline/data/processed/crypto_bronze"
-SILVER_PATH = "E:/Projects/crypto-data-pipeline/data/processed/crypto_silver"
-GOLD_PATH   = "E:/Projects/crypto-data-pipeline/data/processed/crypto_gold"
+RAW_PATH = f"{BASE_DIR}/data/raw_prices.json"
 
-STATE_PATH = "E:/Projects/crypto-data-pipeline/metadata/state.json"
+BRONZE_PATH = f"{BASE_DIR}/data/processed/crypto_bronze"
+SILVER_PATH = f"{BASE_DIR}/data/processed/crypto_silver"
+GOLD_PATH   = f"{BASE_DIR}/data/processed/crypto_gold"
+
+STATE_PATH = f"{BASE_DIR}/metadata/state.json"
+
+# Ensure directories exist
+os.makedirs(f"{BASE_DIR}/metadata", exist_ok=True)
+os.makedirs(f"{BASE_DIR}/data/processed", exist_ok=True)
 
 # =========================
 # SPARK SESSION
 # =========================
 spark = SparkSession.builder \
     .appName("crypto-medallion-pipeline") \
-    .master("local[1]") \
+    .master("local[*]") \
     .config("spark.driver.host", "127.0.0.1") \
-    .config("spark.local.dir", "E:/Projects/crypto-data-pipeline/spark-temp") \
+    .config("spark.local.dir", "/tmp/spark-temp") \
     .config("spark.jars.packages", "io.delta:delta-spark_2.12:3.1.0") \
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
     .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
@@ -67,7 +73,7 @@ schema = StructType([
 if os.path.exists(STATE_PATH):
     with open(STATE_PATH, "r") as f:
         state = json.load(f)
-        last_processed_timestamp = state["last_processed_timestamp"]
+        last_processed_timestamp = state.get("last_processed_timestamp", "1970-01-01T00:00:00")
 else:
     last_processed_timestamp = "1970-01-01T00:00:00"
 
@@ -76,6 +82,11 @@ print("Last processed timestamp:", last_processed_timestamp)
 # =========================
 # READ DATA
 # =========================
+if not os.path.exists(RAW_PATH):
+    print("Raw file not found, skipping processing.")
+    spark.stop()
+    sys.exit(0)
+
 df = spark.read.schema(schema).json(RAW_PATH)
 
 df = df.withColumn("timestamp", to_timestamp("timestamp"))
@@ -90,7 +101,7 @@ new_count = df_new.count()
 print("New records:", new_count)
 
 # ==========================================================
-# 🥇 BRONZE (RAW + MERGE)
+# 🥇 BRONZE
 # ==========================================================
 if new_count > 0:
     if not DeltaTable.isDeltaTable(spark, BRONZE_PATH):
@@ -108,10 +119,9 @@ if new_count > 0:
          .execute()
 
 # ==========================================================
-# 🥈 SILVER (REAL CLEANING)
+# 🥈 SILVER
 # ==========================================================
 if new_count > 0:
-
     df_silver = df_new \
         .dropna(subset=["price_usd", "asset_id"]) \
         .filter(col("price_usd") > 0) \
@@ -128,10 +138,9 @@ if new_count > 0:
     print("Silver updated")
 
 # ==========================================================
-# 🥇 GOLD (AGGREGATION)
+# 🥇 GOLD
 # ==========================================================
 if DeltaTable.isDeltaTable(spark, SILVER_PATH):
-
     df_full = spark.read.format("delta").load(SILVER_PATH)
 
     df_gold = df_full.groupBy("asset_id").agg(
@@ -158,20 +167,13 @@ if new_count > 0:
             json.dump({"last_processed_timestamp": max_ts.isoformat()}, f)
 
 # ==========================================================
-# 📊 VALIDATION + COUNTS
+# VALIDATION
 # ==========================================================
 print("\n=== DATA VALIDATION ===")
 
 if DeltaTable.isDeltaTable(spark, BRONZE_PATH):
     df_b = spark.read.format("delta").load(BRONZE_PATH)
-
     print("Bronze count:", df_b.count())
-
-    null_price = df_b.filter(col("price_usd").isNull()).count()
-    print("Null price rows:", null_price)
-
-    dup = df_b.groupBy("asset_id", "timestamp").count().filter("count > 1").count()
-    print("Duplicate rows:", dup)
 
 if DeltaTable.isDeltaTable(spark, SILVER_PATH):
     print("Silver count:", spark.read.format("delta").load(SILVER_PATH).count())
