@@ -1,4 +1,4 @@
-# 🚀 Crypto Data Pipeline (Spark + Delta Lake)
+# 🚀 Crypto Data Pipeline (Spark + Delta Lake) 
 
 ---
 
